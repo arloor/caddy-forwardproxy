@@ -335,7 +335,7 @@ func setup(c *caddy.Controller) error {
 		return fp
 	})
 
-	makeBuffer := func() interface{} { return make([]byte, 0, 32*1024) }
+	makeBuffer := func() interface{} { return make([]byte, 0, 64*1024) } //64KB
 	bufferPool = sync.Pool{New: makeBuffer}
 	return nil
 }

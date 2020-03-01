@@ -25,13 +25,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"sync"
+
 	//"math"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/caddyhttp/httpserver"
@@ -111,7 +112,7 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		// copy bytes from r to w
 		buf := bufferPool.Get().([]byte)
 		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, throttle)
+		_, _err := flushingIoCopy(w, r, buf)
 		if closeWriter, ok := w.(interface {
 			CloseWrite() error
 		}); ok {
@@ -120,18 +121,37 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		return _err
 	}
 
-	//go func() {
-	//  //todo:
-	//	// 查redis情况，是否超出限制，
-	//	time.Sleep(time.Second)
-	//	target.Close()
-	//	clientWriter.(interface{
-	//		Close() error
-	//	}).Close()
-	//}()
+	streamWithRateLimiting := func(w io.Writer, r io.Reader) error {
+		//go func() {
+		////todo:
+		//	// 查redis情况，是否超出限制，
+		//	time.Sleep(time.Second)
+		//	target.Close()
+		//	clientWriter.(interface{
+		//		Close() error
+		//	}).Close()
+		//	if throttle!=nil{
+		//		throttle.Stop()
+		//	}
+		//}()
+
+		// copy bytes from r to w
+		buf := bufferPool.Get().([]byte)
+		buf = buf[0:cap(buf)]
+		_, _err := flushingIoCopyWithTimeTicker(w, r, buf, throttle)
+		if closeWriter, ok := w.(interface {
+			CloseWrite() error
+		}); ok {
+			closeWriter.CloseWrite()
+		}
+		if throttle != nil {
+			throttle.Stop()
+		}
+		return _err
+	}
 
 	go stream(target, clientReader)
-	return stream(clientWriter, target)
+	return streamWithRateLimiting(clientWriter, target)
 }
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
@@ -190,7 +210,7 @@ func (fp *ForwardProxy) checkCredentials(r *http.Request) (error, *time.Ticker) 
 			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
 			// mindlessly substituted with constant time algo and there ARE known issues with this code,
 			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
-			return nil, nil //time.NewTicker(time.Second /70) //todo、增加判断是否增加令牌桶的算法
+			return nil, time.NewTicker(time.Second / 16)
 		}
 	}
 	return errors.New("Invalid credentials"), nil
@@ -506,45 +526,54 @@ func removeHopByHop(header http.Header) {
 	}
 }
 
+func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	return flushingIoCopyWithTimeTicker(dst, src, buf, nil)
+}
+
 // flushingIoCopy is analogous to buffering io.Copy(), but also attempts to flush on each iteration.
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
-func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, throttle *time.Ticker) (written int64, err error) {
+func flushingIoCopyWithTimeTicker(dst io.Writer, src io.Reader, buf []byte, throttle *time.Ticker) (written int64, err error) {
 	flusher, ok := dst.(http.Flusher)
 	//if !ok {
 	//	return io.CopyBuffer(dst, src, buf)
 	//}
+
 	for {
 		nr, er := src.Read(buf)
+		fmt.Println(nr, cap(buf))
 		if nr > 0 {
 
 			///////////////////////////////////////////////
-			var nw = 0
-			var ew error = nil
-			var step = 10240 //10kb
-			for nw != nr {
-				var nextCurser = nr
-				if nw+step < nextCurser {
-					nextCurser = nw + step
-				}
-				tempNum, err := dst.Write(buf[nw:nextCurser])
-				nw += tempNum
-				ew = err
-				if err != nil {
-					break
-				}
-				if ok {
-					flusher.Flush()
-				}
-				if throttle != nil {
-					<-throttle.C // rate limit our flows
-				}
-			}
-			///////////////////////////////////
-			//nw, ew := dst.Write(buf[0:nr])
-			//if ok {
-			//	flusher.Flush()
+			//var nw = 0
+			//var ew error = nil
+			//var step = 143360 //10kb
+			//for nw != nr {
+			//	var nextCurser = nr
+			//	if nw+step < nextCurser {
+			//		nextCurser = nw + step
+			//	}
+			//	tempNum, err := dst.Write(buf[nw:nextCurser])
+			//	nw += tempNum
+			//	ew = err
+			//	if err != nil {
+			//		break
+			//	}
+			//	if ok {
+			//		flusher.Flush()
+			//	}
+			//	if throttle != nil {
+			//		<-throttle.C // rate limit our flows
+			//	}
 			//}
+			///////////////////////////////////
+			nw, ew := dst.Write(buf[0:nr])
+			if ok {
+				flusher.Flush()
+			}
+			if throttle != nil {
+				<-throttle.C // rate limit our flows
+			}
 
 			if nw > 0 {
 				written += int64(nw)
