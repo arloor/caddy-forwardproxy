@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	//"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -505,10 +506,31 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, er
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if ok {
-				flusher.Flush()
+
+			///////////////////////////////////////////////
+			var nw = 0
+			var ew error = nil
+			for nw != nr {
+				var nextCurser = nr
+				if nw+100 < nextCurser {
+					nextCurser = nw + 100
+				}
+				tempNum, err := dst.Write(buf[nw:nextCurser])
+				nw += tempNum
+				ew = err
+				if err != nil {
+					break
+				}
+				if ok {
+					flusher.Flush()
+				}
 			}
+			///////////////////////////////////
+			//nw, ew := dst.Write(buf[0:nr])
+			//if ok {
+			//	flusher.Flush()
+			//}
+
 			if nw > 0 {
 				written += int64(nw)
 			}
