@@ -164,6 +164,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) (int, error) {
 	return 0, dualStream(targetConn, clientConn, clientConn)
 }
 
+// todo: 针对basic auth做更多处理，看是否需要限速
 // Returns nil error on successful credentials check.
 func (fp *ForwardProxy) checkCredentials(r *http.Request) error {
 	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
@@ -498,14 +499,16 @@ func removeHopByHop(header http.Header) {
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
 func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
 	flusher, ok := dst.(http.Flusher)
-	if !ok {
-		return io.CopyBuffer(dst, src, buf)
-	}
+	//if !ok {
+	//	return io.CopyBuffer(dst, src, buf)
+	//}
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw, ew := dst.Write(buf[0:nr])
-			flusher.Flush()
+			if ok {
+				flusher.Flush()
+			}
 			if nw > 0 {
 				written += int64(nw)
 			}
