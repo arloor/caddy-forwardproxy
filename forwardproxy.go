@@ -106,12 +106,12 @@ func (fp *ForwardProxy) portIsAllowed(port string) bool {
 // Copies data target->clientReader and clientWriter->target, and flushes as needed
 // Returns when clientWriter-> target stream is done.
 // Caddy should finish writing target -> clientReader.
-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer) error {
+func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, throttle *time.Ticker) error {
 	stream := func(w io.Writer, r io.Reader) error {
 		// copy bytes from r to w
 		buf := bufferPool.Get().([]byte)
 		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf)
+		_, _err := flushingIoCopy(w, r, buf, throttle)
 		if closeWriter, ok := w.(interface {
 			CloseWrite() error
 		}); ok {
@@ -120,13 +120,23 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		return _err
 	}
 
+	//go func() {
+	//  //todo:
+	//	// 查redis情况，是否超出限制，
+	//	time.Sleep(time.Second)
+	//	target.Close()
+	//	clientWriter.(interface{
+	//		Close() error
+	//	}).Close()
+	//}()
+
 	go stream(target, clientReader)
 	return stream(clientWriter, target)
 }
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) (int, error) {
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, throttle *time.Ticker) (int, error) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		return http.StatusInternalServerError, errors.New("ResponseWriter does not implement Hijacker")
@@ -162,28 +172,28 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) (int, error) {
 		return http.StatusInternalServerError, errors.New("failed to send response to client: " + err.Error())
 	}
 
-	return 0, dualStream(targetConn, clientConn, clientConn)
+	return 0, dualStream(targetConn, clientConn, clientConn, throttle)
 }
 
 // todo: 针对basic auth做更多处理，看是否需要限速
 // Returns nil error on successful credentials check.
-func (fp *ForwardProxy) checkCredentials(r *http.Request) error {
+func (fp *ForwardProxy) checkCredentials(r *http.Request) (error, *time.Ticker) {
 	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
 	if len(pa) != 2 {
-		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
+		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>"), nil
 	}
 	if strings.ToLower(pa[0]) != "basic" {
-		return errors.New("Auth type is not supported")
+		return errors.New("Auth type is not supported"), nil
 	}
 	for _, creds := range fp.authCredentials {
 		if subtle.ConstantTimeCompare(creds, []byte(pa[1])) == 1 {
 			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
 			// mindlessly substituted with constant time algo and there ARE known issues with this code,
 			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
-			return nil
+			return nil, nil //time.NewTicker(time.Second /70) //todo、增加判断是否增加令牌桶的算法
 		}
 	}
-	return errors.New("Invalid credentials")
+	return errors.New("Invalid credentials"), nil
 }
 
 // borrowed from `proxy` plugin
@@ -292,8 +302,9 @@ func (fp *ForwardProxy) dialContextCheckACL(ctx context.Context, network, hostPo
 
 func (fp *ForwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	var authErr error
+	var throttle *time.Ticker
 	if fp.authRequired {
-		authErr = fp.checkCredentials(r)
+		authErr, throttle = fp.checkCredentials(r)
 	}
 	if fp.probeResistEnabled && len(fp.probeResistDomain) > 0 && stripPort(r.Host) == fp.probeResistDomain {
 		return serveHiddenPage(w, authErr)
@@ -357,7 +368,7 @@ func (fp *ForwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, 
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return serveHijack(w, targetConn, throttle)
 		case 2: // http2: keep reading from "request" and writing into same response
 			defer r.Body.Close()
 			wFlusher, ok := w.(http.Flusher)
@@ -366,7 +377,7 @@ func (fp *ForwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, 
 			}
 			w.WriteHeader(http.StatusOK)
 			wFlusher.Flush()
-			return 0, dualStream(targetConn, r.Body, w)
+			return 0, dualStream(targetConn, r.Body, w, throttle)
 		default:
 			panic("There was a check for http version, yet it's incorrect")
 		}
@@ -498,7 +509,7 @@ func removeHopByHop(header http.Header) {
 // flushingIoCopy is analogous to buffering io.Copy(), but also attempts to flush on each iteration.
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
-func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, throttle *time.Ticker) (written int64, err error) {
 	flusher, ok := dst.(http.Flusher)
 	//if !ok {
 	//	return io.CopyBuffer(dst, src, buf)
@@ -510,10 +521,11 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, er
 			///////////////////////////////////////////////
 			var nw = 0
 			var ew error = nil
+			var step = 10240 //10kb
 			for nw != nr {
 				var nextCurser = nr
-				if nw+100 < nextCurser {
-					nextCurser = nw + 100
+				if nw+step < nextCurser {
+					nextCurser = nw + step
 				}
 				tempNum, err := dst.Write(buf[nw:nextCurser])
 				nw += tempNum
@@ -523,6 +535,9 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte) (written int64, er
 				}
 				if ok {
 					flusher.Flush()
+				}
+				if throttle != nil {
+					<-throttle.C // rate limit our flows
 				}
 			}
 			///////////////////////////////////
